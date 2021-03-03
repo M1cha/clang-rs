@@ -58,6 +58,28 @@ use utility::{FromError, Nullable};
 mod error;
 pub use self::error::*;
 
+extern "C" {
+    fn clang_getTypePrintingPolicy(ty: CXType) -> CXPrintingPolicy;
+    fn clang_getTypeSpellingWithPolicy(ty: CXType, policy: CXPrintingPolicy) -> CXString;
+    fn clang_PrintingPolicy_setCallbacks(
+        policy: clang_sys::CXPrintingPolicy,
+        callbacks: *const CXPrintingPolicyCallbacks,
+        client_data: CXClientData,
+    );
+
+    fn clang_OutputStream_write(out: CXOutputStream, s: *const std::os::raw::c_char);
+    fn clang_OutputStream_writeByte(out: CXOutputStream, c: std::os::raw::c_uchar);
+    fn clang_OutputStream_tell(out: CXOutputStream) -> std::os::raw::c_ulonglong;
+}
+
+#[repr(C)]
+struct CXPrintingPolicyCallbacks {
+    handle_type: extern "C" fn(CXOutputStream, CXType, std::os::raw::c_uint, CXClientData),
+    handle_declref: extern "C" fn(CXOutputStream, CXCursor, std::os::raw::c_uint, CXClientData),
+}
+
+type CXOutputStream = *mut std::ffi::c_void;
+
 //================================================
 // Enums
 //================================================
@@ -2897,23 +2919,143 @@ impl PlatformAvailability {
 
 // PrettyPrinter _________________________________
 
+/// write to a llvm stream
+#[derive(Clone, Copy, Debug)]
+pub struct ClangOutputStream(CXOutputStream);
+
+impl ClangOutputStream {
+    /// return the number of bytes that have been written to the stream
+    pub fn len(&self) -> std::os::raw::c_ulonglong {
+        unsafe { clang_OutputStream_tell(self.0) }
+    }
+
+    /// write a single byte
+    pub fn write_byte(&self, c: u8) {
+        unsafe { clang_OutputStream_writeByte(self.0, c) }
+    }
+}
+
+impl std::fmt::Write for ClangOutputStream {
+    fn write_str(&mut self, s: &str) -> Result<(), std::fmt::Error> {
+        let s = std::ffi::CString::new(s).unwrap();
+        unsafe {
+            clang_OutputStream_write(self.0, s.as_ptr());
+        }
+        Ok(())
+    }
+}
+
+/// printing policy callbacks
+pub trait PrintingPolicyCallback<'tu>: std::fmt::Debug {
+    /// called before and after printing a type name
+    fn handle_type(&self, _out: &mut ClangOutputStream, _ty: &'tu Type, _end: bool) {}
+    /// called before and after printing a decl ref
+    fn handle_declref(&self, _out: &mut ClangOutputStream, _entity: &'tu Entity, _end: bool) {}
+}
+
+extern "C" fn handle_type(
+    out: CXOutputStream,
+    ty: CXType,
+    end: std::os::raw::c_uint,
+    data: CXClientData,
+) {
+    let &mut (tu, ref mut callbacks) =
+        unsafe { &mut *(data as *mut (&TranslationUnit, Box<dyn PrintingPolicyCallback>)) };
+    let mut out = ClangOutputStream(out);
+    let ty = Type::from_raw(ty, tu);
+    callbacks.handle_type(&mut out, &ty, end != 0);
+}
+
+extern "C" fn handle_declref(
+    out: CXOutputStream,
+    cursor: CXCursor,
+    end: std::os::raw::c_uint,
+    data: CXClientData,
+) {
+    let &mut (tu, ref mut callbacks) =
+        unsafe { &mut *(data as *mut (&TranslationUnit, Box<dyn PrintingPolicyCallback>)) };
+    let mut out = ClangOutputStream(out);
+    let ty = Entity::from_raw(cursor, tu);
+    callbacks.handle_declref(&mut out, &ty, end != 0);
+}
+
+static POLICY_CALLBACKS: CXPrintingPolicyCallbacks = CXPrintingPolicyCallbacks {
+    handle_type,
+    handle_declref,
+};
+
+#[cfg(feature = "clang_7_0")]
+#[derive(Debug)]
+enum PrettyPrinterType<'tu> {
+    Entity(&'tu Entity<'tu>),
+    Type(&'tu Type<'tu>),
+}
+
+impl<'tu> PrettyPrinterType<'tu> {
+    fn get_translation_unit(&self) -> &'tu TranslationUnit<'tu> {
+        match *self {
+            PrettyPrinterType::Entity(e) => e.get_translation_unit(),
+            PrettyPrinterType::Type(ty) => ty.get_translation_unit(),
+        }
+    }
+}
+
 /// Pretty prints declarations.
 #[cfg(feature="clang_7_0")]
 #[derive(Debug)]
-pub struct PrettyPrinter<'e> {
+pub struct PrettyPrinter<'tu> {
     ptr: CXPrintingPolicy,
-    entity: &'e Entity<'e>,
+    ty: PrettyPrinterType<'tu>,
+    callbacks: Option<
+        Box<(
+            &'tu TranslationUnit<'tu>,
+            Box<dyn 'tu + PrintingPolicyCallback<'tu>>,
+        )>,
+    >,
 }
 #[cfg(feature="clang_7_0")]
-impl<'e> PrettyPrinter<'e> {
+impl<'tu> PrettyPrinter<'tu> {
     //- Constructors -----------------------------
 
-    fn from_raw(ptr: CXPrintingPolicy, entity: &'e Entity<'e>) -> Self {
+    fn from_raw(ptr: CXPrintingPolicy, entity: &'tu Entity<'tu>) -> Self {
         assert!(!ptr.is_null());
-        PrettyPrinter { ptr, entity }
+        PrettyPrinter {
+            ptr,
+            ty: PrettyPrinterType::Entity(entity),
+            callbacks: None,
+        }
+    }
+
+    fn from_raw_type(ptr: CXPrintingPolicy, ty: &'tu Type<'tu>) -> Self {
+        assert!(!ptr.is_null());
+        PrettyPrinter {
+            ptr,
+            ty: PrettyPrinterType::Type(ty),
+            callbacks: None,
+        }
     }
 
     //- Accessors --------------------------------
+
+    /// set callbacks which will be called during printing
+    pub fn set_callbacks<C: 'tu + PrintingPolicyCallback<'tu>>(&mut self, callbacks: Option<C>) {
+        self.callbacks = if let Some(c) = callbacks {
+            Some(Box::new((self.ty.get_translation_unit(), Box::new(c))))
+        } else {
+            None
+        };
+        unsafe {
+            if let Some(callbacks) = self.callbacks.as_mut() {
+                clang_PrintingPolicy_setCallbacks(
+                    self.ptr,
+                    &POLICY_CALLBACKS,
+                    utility::addressof(callbacks.as_mut()),
+                )
+            } else {
+                clang_PrintingPolicy_setCallbacks(self.ptr, std::ptr::null(), std::ptr::null_mut())
+            }
+        }
+    }
 
     /// Gets the specified flag value.
     pub fn get_flag(&self, flag: PrintingPolicyFlag) -> bool {
@@ -2942,7 +3084,16 @@ impl<'e> PrettyPrinter<'e> {
 
     /// Pretty print the declaration.
     pub fn print(&self) -> String {
-        unsafe { utility::to_string(clang_getCursorPrettyPrinted(self.entity.raw, self.ptr)) }
+        unsafe {
+            match &self.ty {
+                PrettyPrinterType::Entity(entity) => {
+                    utility::to_string(clang_getCursorPrettyPrinted(entity.raw, self.ptr))
+                }
+                PrettyPrinterType::Type(ty) => {
+                    utility::to_string(clang_getTypeSpellingWithPolicy(ty.raw, self.ptr))
+                }
+            }
+        }
     }
 }
 
@@ -3163,9 +3314,19 @@ impl<'tu> Type<'tu> {
 
     //- Accessors --------------------------------
 
+    /// Returns the translation unit which contains this AST type.
+    pub fn get_translation_unit(&self) -> &'tu TranslationUnit<'tu> {
+        self.tu
+    }
+
     /// Returns the kind of this type.
     pub fn get_kind(&self) -> TypeKind {
         TypeKind::from_raw_infallible(self.raw.kind)
+    }
+
+    /// Returns the pretty printer for this declaration.
+    pub fn get_pretty_printer(&self) -> PrettyPrinter {
+        unsafe { PrettyPrinter::from_raw_type(clang_getTypePrintingPolicy(self.raw), self) }
     }
 
     /// Returns the display name of this type.
