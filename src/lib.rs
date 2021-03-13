@@ -76,6 +76,7 @@ extern "C" {
 struct CXPrintingPolicyCallbacks {
     handle_type: extern "C" fn(CXOutputStream, CXType, std::os::raw::c_uint, CXClientData),
     handle_declref: extern "C" fn(CXOutputStream, CXCursor, std::os::raw::c_uint, CXClientData),
+    convert_decl_name: extern "C" fn(CXOutputStream, *const std::os::raw::c_char, CXClientData),
 }
 
 type CXOutputStream = *mut std::ffi::c_void;
@@ -1111,6 +1112,10 @@ pub enum PrintingPolicyFlag {
     SuppressImplicitBase = 24,
     /// Whether to print the fully qualified name of function declarations.
     PrintFullyQualifiedName = 25,
+    /// Weather to omit code e.g. from function bodies
+    OmitCode = 26,
+    /// Weather to indicate omitted code using a marker
+    PrintOmittedCodeMarker = 27,
 }
 
 // RefQualifier __________________________________
@@ -2951,6 +2956,8 @@ pub trait PrintingPolicyCallback<'tu>: std::fmt::Debug {
     fn handle_type(&self, _out: &mut ClangOutputStream, _ty: &'tu Type, _end: bool) {}
     /// called before and after printing a decl ref
     fn handle_declref(&self, _out: &mut ClangOutputStream, _entity: &'tu Entity, _end: bool) {}
+    /// called before and after printing the placeholder
+    fn convert_decl_name(&self, _out: &mut ClangOutputStream, _s: &str) {}
 }
 
 extern "C" fn handle_type(
@@ -2979,9 +2986,22 @@ extern "C" fn handle_declref(
     callbacks.handle_declref(&mut out, &ty, end != 0);
 }
 
+extern "C" fn convert_decl_name(
+    out: CXOutputStream,
+    name: *const std::os::raw::c_char,
+    data: CXClientData,
+) {
+    let &mut (tu, ref mut callbacks) =
+        unsafe { &mut *(data as *mut (&TranslationUnit, Box<dyn PrintingPolicyCallback>)) };
+    let mut out = ClangOutputStream(out);
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    callbacks.convert_decl_name(&mut out, name.to_str().unwrap());
+}
+
 static POLICY_CALLBACKS: CXPrintingPolicyCallbacks = CXPrintingPolicyCallbacks {
     handle_type,
     handle_declref,
+    convert_decl_name,
 };
 
 #[cfg(feature = "clang_7_0")]
